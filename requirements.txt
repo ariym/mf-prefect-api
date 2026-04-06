@@ -1,0 +1,4 @@
+prefect>=3.0
+fastapi[standard]
+uvicorn[standard]
+pydantic>=2.0
