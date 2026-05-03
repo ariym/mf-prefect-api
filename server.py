@@ -9,7 +9,6 @@ import logging
 import os
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -25,6 +24,11 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from prefect import flow, task
 from prefect.context import get_run_context
+from job_auditok import router as auditok_router
+from job_scenedetect import router as scenedetect_router
+from job_shared import APPS_DIR, AUDITOK_SCRIPT, SCENEDETECT_SCRIPT, WHISPERX_SCRIPT
+from job_test import router as test_router
+from job_whisperx import router as whisperx_router
 
 logger = logging.getLogger("prefect-api")
 logger.setLevel(logging.INFO)
@@ -35,9 +39,32 @@ if not logger.handlers:
     )
     logger.addHandler(_handler)
 
-APPS_DIR = Path(__file__).resolve().parent.parent
-SAMPLE_MEDIA_DIR = Path("/home/cursor/sample_media")
 BATCH_STATE_FILE = Path(__file__).resolve().parent / ".batch_state.json"
+
+
+def _load_repo_env() -> None:
+    """Load key=value pairs from repo .env into process env if unset."""
+    env_path = APPS_DIR / ".env"
+    if not env_path.is_file():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key:
+            os.environ.setdefault(key, value)
+
+
+_load_repo_env()
 
 VIDEO_EXTENSIONS = {
     ".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv",
@@ -47,95 +74,6 @@ VIDEO_EXTENSIONS = {
 # ---------------------------------------------------------------------------
 # Pydantic request/response models
 # ---------------------------------------------------------------------------
-
-
-class SceneDetectRequest(BaseModel):
-    input: str = Field(..., description="Path to input video file")
-    threshold: float = Field(27.0, description="ContentDetector threshold")
-    output: Optional[str] = Field(None, description="Save scene list JSON to this path")
-    quiet: bool = Field(False, description="Suppress progress output")
-
-
-class SceneDetectScene(BaseModel):
-    id: int
-    start: float
-    end: float
-    start_timecode: str
-    end_timecode: str
-    start_frame: int
-    end_frame: int
-
-
-class SceneDetectResponse(BaseModel):
-    video: str
-    scenes: list[SceneDetectScene]
-    count: int
-
-
-class AuditokRequest(BaseModel):
-    input: str = Field(..., description="Path to input audio file")
-    save_detections_as: Optional[str] = Field(
-        None,
-        description="Output path template with {id}, {start}, {end}, {duration} placeholders",
-    )
-    min_dur: float = Field(0.2, description="Minimum event duration in seconds")
-    max_dur: float = Field(5.0, description="Maximum event duration in seconds")
-    max_silence: float = Field(0.3, description="Max silence within event in seconds")
-    energy_threshold: float = Field(50.0, description="Log energy threshold")
-    quiet: bool = Field(False, description="Suppress stdout output")
-
-
-class AuditokEvent(BaseModel):
-    id: int
-    start: float
-    end: float
-
-
-class AuditokResponse(BaseModel):
-    audio: str
-    events: list[AuditokEvent]
-    count: int
-    raw_output: str
-
-
-class WhisperXRequest(BaseModel):
-    audio: list[str] = Field(..., description="Audio file path(s) to transcribe", min_length=1)
-    model: str = Field("base.en", description="Whisper model name (base.en for speed, small.en for accuracy)")
-    model_dir: Optional[str] = Field(None, description="Model cache directory")
-    device: Optional[str] = Field("cuda", description="Inference device (cuda/cpu)")
-    device_index: int = Field(0, description="GPU device index")
-    batch_size: int = Field(16, description="Batch size for transcription")
-    compute_type: Optional[str] = Field("float16", description="float16, float32, int8, or int8_float16")
-    output_dir: Optional[str] = Field(None, description="Output directory")
-    output_format: str = Field("all", description="Output format: all, srt, vtt, txt, tsv, json, aud")
-    task: str = Field("transcribe", description="transcribe or translate")
-    language: Optional[str] = Field("en", description="Language code (auto-detect if null)")
-    align_model: Optional[str] = Field(None, description="Alignment model name")
-    interpolate_method: str = Field("nearest", description="nearest, linear, or ignore")
-    no_align: bool = Field(False, description="Skip phoneme alignment")
-    return_char_alignments: bool = Field(False, description="Include char-level alignments")
-    vad_method: str = Field("pyannote", description="VAD method: pyannote or silero")
-    vad_onset: float = Field(0.500, description="VAD onset threshold")
-    vad_offset: float = Field(0.363, description="VAD offset threshold")
-    chunk_size: int = Field(30, description="VAD chunk size in seconds")
-    diarize: bool = Field(True, description="Enable speaker diarization")
-    min_speakers: Optional[int] = Field(None, description="Minimum number of speakers")
-    max_speakers: Optional[int] = Field(None, description="Maximum number of speakers")
-    hf_token: Optional[str] = Field(None, description="Hugging Face token for gated models")
-    verbose: bool = Field(True, description="Print progress/debug output")
-
-
-class WhisperXResponse(BaseModel):
-    audio_files: list[str]
-    output_dir: str
-    output_files: list[str]
-    raw_output: str
-
-
-class TestResponse(BaseModel):
-    scenedetect: SceneDetectResponse
-    auditok: AuditokResponse
-    whisperx: WhisperXResponse
 
 
 class JobStatus(str, Enum):
@@ -181,178 +119,6 @@ class BatchSummary(BaseModel):
 
 class BatchDetail(BatchSummary):
     jobs: list[VideoJobInfo]
-
-
-# ---------------------------------------------------------------------------
-# Prefect tasks — subprocess wrappers
-# ---------------------------------------------------------------------------
-
-
-@task(name="run-scenedetect", retries=1, log_prints=True)
-def run_scenedetect(request: SceneDetectRequest) -> SceneDetectResponse:
-    """Run PySceneDetect on a video file and return structured results."""
-    script = str(APPS_DIR / "scenedetect-microservice" / "scenedetect_service.sh")
-    cmd = [script, request.input, "-j", "-t", str(request.threshold)]
-
-    if request.output:
-        cmd += ["-o", request.output]
-    if request.quiet:
-        cmd.append("-q")
-
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"scenedetect exited with code {result.returncode}: {result.stderr.strip()}"
-        )
-
-    data = json.loads(result.stdout)
-    return SceneDetectResponse(**data)
-
-
-@task(name="run-auditok", retries=1, log_prints=True)
-def run_auditok(request: AuditokRequest) -> AuditokResponse:
-    """Run auditok on an audio file and return detected events."""
-    script = str(APPS_DIR / "auditok-microservice" / "auditok_service.sh")
-    cmd = [
-        script,
-        request.input,
-        "-n", str(request.min_dur),
-        "-m", str(request.max_dur),
-        "-s", str(request.max_silence),
-        "-e", str(request.energy_threshold),
-    ]
-
-    if request.save_detections_as:
-        cmd += ["-o", request.save_detections_as]
-    if request.quiet:
-        cmd.append("-q")
-
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"auditok exited with code {result.returncode}: {result.stderr.strip()}"
-        )
-
-    events = []
-    for line in result.stdout.strip().splitlines():
-        parts = line.split()
-        if len(parts) >= 3 and not line.strip().startswith("Saved:"):
-            try:
-                events.append(AuditokEvent(
-                    id=int(parts[0]),
-                    start=float(parts[1]),
-                    end=float(parts[2]),
-                ))
-            except (ValueError, IndexError):
-                continue
-
-    return AuditokResponse(
-        audio=request.input,
-        events=events,
-        count=len(events),
-        raw_output=result.stdout,
-    )
-
-
-@task(name="run-whisperx", retries=1, log_prints=True)
-def run_whisperx(request: WhisperXRequest) -> WhisperXResponse:
-    """Run WhisperX on audio file(s) and return transcription results."""
-    script = str(APPS_DIR / "whisperx-microservice" / "whisperx_service.sh")
-
-    out_dir = request.output_dir or tempfile.mkdtemp(prefix="whisperx_")
-    os.makedirs(out_dir, exist_ok=True)
-
-    cmd = [script] + request.audio
-    cmd += ["--model", request.model]
-    cmd += ["-o", out_dir]
-    cmd += ["-f", request.output_format]
-    cmd += ["--task", request.task]
-    cmd += ["--batch_size", str(request.batch_size)]
-    cmd += ["--device_index", str(request.device_index)]
-    cmd += ["--vad_method", request.vad_method]
-    cmd += ["--vad_onset", str(request.vad_onset)]
-    cmd += ["--vad_offset", str(request.vad_offset)]
-    cmd += ["--chunk_size", str(request.chunk_size)]
-    cmd += ["--interpolate_method", request.interpolate_method]
-
-    if request.device:
-        cmd += ["--device", request.device]
-    if request.compute_type:
-        cmd += ["--compute_type", request.compute_type]
-    if request.model_dir:
-        cmd += ["--model_dir", request.model_dir]
-    if request.language:
-        cmd += ["--language", request.language]
-    if request.align_model:
-        cmd += ["--align_model", request.align_model]
-    if request.no_align:
-        cmd.append("--no_align")
-    if request.return_char_alignments:
-        cmd.append("--return_char_alignments")
-    if request.diarize:
-        cmd.append("--diarize")
-    if request.min_speakers is not None:
-        cmd += ["--min_speakers", str(request.min_speakers)]
-    if request.max_speakers is not None:
-        cmd += ["--max_speakers", str(request.max_speakers)]
-    if request.hf_token:
-        cmd += ["--hf_token", request.hf_token]
-    if not request.verbose:
-        cmd += ["--verbose", "False"]
-
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"whisperx exited with code {result.returncode}: {result.stderr.strip()}"
-        )
-
-    output_files = [
-        str(p) for p in Path(out_dir).iterdir() if p.is_file()
-    ]
-
-    return WhisperXResponse(
-        audio_files=request.audio,
-        output_dir=out_dir,
-        output_files=sorted(output_files),
-        raw_output=result.stdout[-5000:] if len(result.stdout) > 5000 else result.stdout,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Prefect flows
-# ---------------------------------------------------------------------------
-
-
-@flow(name="scenedetect-flow", log_prints=True)
-def scenedetect_flow(request: SceneDetectRequest) -> SceneDetectResponse:
-    return run_scenedetect(request)
-
-
-@flow(name="auditok-flow", log_prints=True)
-def auditok_flow(request: AuditokRequest) -> AuditokResponse:
-    return run_auditok(request)
-
-
-@flow(name="whisperx-flow", log_prints=True)
-def whisperx_flow(request: WhisperXRequest) -> WhisperXResponse:
-    return run_whisperx(request)
-
-
-@flow(name="test-all-services", log_prints=True)
-def test_all_services_flow() -> TestResponse:
-    """Run all three microservices against sample media for validation."""
-    video_path = str(SAMPLE_MEDIA_DIR / "road_to_damascus.mp4")
-    audio_path = str(SAMPLE_MEDIA_DIR / "ct_beans.mp3")
-
-    scene_result = run_scenedetect(SceneDetectRequest(input=video_path))
-    auditok_result = run_auditok(AuditokRequest(input=audio_path))
-    whisperx_result = run_whisperx(WhisperXRequest(audio=[audio_path]))
-
-    return TestResponse(
-        scenedetect=scene_result,
-        auditok=auditok_result,
-        whisperx=whisperx_result,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -537,7 +303,7 @@ def batch_run_scenedetect(video_path: str, output_file: str) -> bool:
     """Run SceneDetect on a video as part of a batch."""
     return _run_service(
         "SceneDetect",
-        [str(APPS_DIR / "scenedetect-microservice" / "scenedetect_service.sh"),
+        [str(SCENEDETECT_SCRIPT),
          video_path, "-j"],
         output_file,
         timeout=600,
@@ -549,7 +315,7 @@ def batch_run_auditok(video_path: str, output_file: str) -> bool:
     """Run Auditok on a video as part of a batch."""
     return _run_service(
         "Auditok",
-        [str(APPS_DIR / "auditok-microservice" / "auditok_service.sh"),
+        [str(AUDITOK_SCRIPT),
          video_path],
         output_file,
         timeout=600,
@@ -561,8 +327,8 @@ def batch_run_whisperx(video_path: str, output_file: str) -> bool:
     """Run WhisperX on a video as part of a batch."""
     return _run_service(
         "WhisperX",
-        [str(APPS_DIR / "whisperx-microservice" / "whisperx_service.sh"),
-         video_path, "-o", str(Path(video_path).parent)],
+        [str(WHISPERX_SCRIPT),
+         video_path],
         output_file,
         timeout=1800,
     )
@@ -733,46 +499,10 @@ app = FastAPI(
 )
 
 
-@app.post("/api/scenedetect", response_model=SceneDetectResponse)
-async def api_scenedetect(request: SceneDetectRequest):
-    """Detect scene cuts in a video file using PySceneDetect."""
-    try:
-        return scenedetect_flow(request)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/auditok", response_model=AuditokResponse)
-async def api_auditok(request: AuditokRequest):
-    """Detect audio activity regions in an audio file using auditok."""
-    try:
-        return auditok_flow(request)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/whisperx", response_model=WhisperXResponse)
-async def api_whisperx(request: WhisperXRequest):
-    """Transcribe audio file(s) using WhisperX."""
-    try:
-        return whisperx_flow(request)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/test", response_model=TestResponse)
-async def api_test():
-    """
-    Test all microservices using sample media files.
-    
-    - scenedetect: /home/cursor/sample_media/road_to_damascus.mp4
-    - whisperx:    /home/cursor/sample_media/ct_beans.mp3
-    - auditok:     /home/cursor/sample_media/ct_beans.mp3
-    """
-    try:
-        return test_all_services_flow()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+app.include_router(scenedetect_router)
+app.include_router(auditok_router)
+app.include_router(whisperx_router)
+app.include_router(test_router)
 
 
 # ---------------------------------------------------------------------------
