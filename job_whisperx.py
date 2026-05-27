@@ -1,4 +1,3 @@
-import json
 import os
 import sqlite3
 import subprocess
@@ -173,11 +172,6 @@ def _save_whisperx_to_db(audio_path: str, json_path: Path) -> None:
             data = json.load(f)
 
         segments = data.get("segments", [])
-        transcript_text = " ".join(
-            seg.get("text", "").strip() for seg in segments if seg.get("text")
-        ).strip()
-        language = data.get("language")
-        raw_json = json.dumps(data)
 
         conn = sqlite3.connect(sqlite_db_path())
         init_db(conn)
@@ -200,19 +194,6 @@ def _save_whisperx_to_db(audio_path: str, json_path: Path) -> None:
                 )
                 for idx, seg in enumerate(segments)
             ],
-        )
-        conn.execute(
-            """
-            INSERT INTO whisperx_transcripts
-            (media_file_id, language, transcript_text, raw_json)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(media_file_id) DO UPDATE SET
-                language = excluded.language,
-                transcript_text = excluded.transcript_text,
-                raw_json = excluded.raw_json,
-                updated_at = CURRENT_TIMESTAMP
-        """,
-            (media_file_id, language, transcript_text, raw_json),
         )
         conn.commit()
     except Exception as exc:

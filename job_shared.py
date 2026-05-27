@@ -51,6 +51,7 @@ def get_media_duration(file_path: str) -> float | None:
 def init_db(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("DROP TABLE IF EXISTS whisperx_transcripts")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS media_files (
@@ -101,28 +102,6 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
     """
     )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS whisperx_transcripts (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            media_file_id   INTEGER NOT NULL UNIQUE REFERENCES media_files(id)
-                                ON DELETE CASCADE,
-            language        TEXT,
-            transcript_text TEXT,
-            raw_json        TEXT,
-            created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
-            updated_at      TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_whisperx_transcripts_media_file_id
-        ON whisperx_transcripts(media_file_id)
-    """
-    )
-
-
 def upsert_media_file(conn: sqlite3.Connection, file_path: str) -> int:
     file_size = os.path.getsize(file_path) if os.path.isfile(file_path) else None
     duration = get_media_duration(file_path)
