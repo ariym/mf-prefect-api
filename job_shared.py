@@ -57,7 +57,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS media_files (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             file_path    TEXT UNIQUE NOT NULL,
-            video_length REAL,
+            duration     REAL,
             file_size    INTEGER,
             created_at   TEXT DEFAULT CURRENT_TIMESTAMP
         )
@@ -107,10 +107,10 @@ def upsert_media_file(conn: sqlite3.Connection, file_path: str) -> int:
     duration = get_media_duration(file_path)
     conn.execute(
         """
-        INSERT INTO media_files (file_path, video_length, file_size)
+        INSERT INTO media_files (file_path, duration, file_size)
         VALUES (?, ?, ?)
         ON CONFLICT(file_path) DO UPDATE SET
-            video_length = COALESCE(excluded.video_length, video_length),
+            duration = COALESCE(excluded.duration, duration),
             file_size    = COALESCE(excluded.file_size, file_size)
     """,
         (file_path, duration, file_size),
