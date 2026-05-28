@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 from prefect import flow, task
 from prefect.context import get_run_context
 from job_auditok import router as auditok_router
+from job_register_media import router as register_media_router
 from job_scenedetect import router as scenedetect_router
 from job_shared import APPS_DIR, AUDITOK_SCRIPT, SCENEDETECT_SCRIPT, WHISPERX_SCRIPT
 from job_test import router as test_router
@@ -503,6 +504,7 @@ app.include_router(scenedetect_router)
 app.include_router(auditok_router)
 app.include_router(whisperx_router)
 app.include_router(test_router)
+app.include_router(register_media_router)
 
 
 # ---------------------------------------------------------------------------

@@ -175,7 +175,7 @@ def _save_whisperx_to_db(audio_path: str, json_path: Path) -> None:
 
         conn = sqlite3.connect(sqlite_db_path())
         init_db(conn)
-        media_file_id = upsert_media_file(conn, audio_path)
+        media_file_id = upsert_media_file(conn, audio_path, "AUD")
         conn.execute("DELETE FROM whisperx_segments WHERE media_file_id = ?", (media_file_id,))
         conn.executemany(
             """

@@ -124,7 +124,7 @@ def _save_auditok_to_db(audio_path: str, events: list[AuditokEvent]) -> None:
     try:
         conn = sqlite3.connect(sqlite_db_path())
         init_db(conn)
-        media_file_id = upsert_media_file(conn, audio_path)
+        media_file_id = upsert_media_file(conn, audio_path, "AUD")
         conn.execute("DELETE FROM auditok_events WHERE media_file_id = ?", (media_file_id,))
         conn.executemany(
             """

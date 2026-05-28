@@ -92,7 +92,7 @@ def _save_scenedetect_to_db(video_path: str, scenes: list[SceneDetectScene]) -> 
     try:
         conn = sqlite3.connect(sqlite_db_path())
         init_db(conn)
-        media_file_id = upsert_media_file(conn, video_path)
+        media_file_id = upsert_media_file(conn, video_path, "VID")
         conn.execute("DELETE FROM scenedetect_scenes WHERE media_file_id = ?", (media_file_id,))
         conn.executemany(
             """
